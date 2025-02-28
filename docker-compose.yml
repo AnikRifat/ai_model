@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  h2o:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: h2o_server
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/data  # Adjust for your data files
+      - ./app:/app    # Contains server.py
+    restart: unless-stopped
