@@ -1,14 +1,12 @@
-version: "3.8"
-
 services:
-  h2o:
+  prophet:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: h2o_server
+    container_name: prophet_server
     ports:
       - "5000:5000"
     volumes:
-      - ./data:/data  # Adjust for your data files
-      - ./app:/app    # Contains server.py
+      - ./data:/data
+      - ./app:/app
     restart: unless-stopped

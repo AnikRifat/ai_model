@@ -1,37 +1,55 @@
-import h2o
-from h2o.automl import H2OAutoML
+from prophet import Prophet
 from flask import Flask, request, jsonify
 import pandas as pd
 import os
+import pickle
 
 app = Flask(__name__)
+model_path = "/app/model.pkl"
 
-# Initialize H2O
-h2o.init()
-
-# Load or train model
-model_path = "/app/trained_model"
+# Train or load model
 if not os.path.exists(model_path):
-    data = h2o.import_file("/data/bookings.csv")
-    aml = H2OAutoML(max_runtime_secs=300, seed=42)
-    aml.train(y="sales_price", training_frame=data)
-    h2o.save_model(aml.leader, path=model_path)
+    bookings = pd.read_csv("/data/bookings.csv")
+    bookings = bookings[['check_in_date', 'price_per_day']].rename(
+        columns={'check_in_date': 'ds', 'price_per_day': 'y'}
+    )
+    bookings['ds'] = pd.to_datetime(bookings['ds'])
+
+    comp_prices = pd.read_csv("/data/competitors_room_prices.csv")
+    comp_prices = comp_prices[['check_date', 'price']].rename(
+        columns={'check_date': 'ds', 'price': 'competitor_price'}
+    )
+    comp_prices['ds'] = pd.to_datetime(comp_prices['ds'])
+    comp_prices = comp_prices.groupby('ds', as_index=False).agg({'competitor_price': 'mean'})
+
+    df = pd.merge(bookings, comp_prices, on='ds', how='left')
+    df['competitor_price'] = df['competitor_price'].fillna(df['competitor_price'].mean())
+
+    model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+    model.add_regressor('competitor_price')
+    model.fit(df)
+
+    with open(model_path, 'wb') as f:
+        pickle.dump(model, f)
 else:
-    model = h2o.load_model(model_path)
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
 
 @app.route('/predict', methods=['GET'])
 def predict():
     date = request.args.get('date')
     room_type = request.args.get('room_type')
-
-    future_data = pd.DataFrame({
-        'check_in_date': [date],
-        'room_type': [room_type],
+    comp_prices = pd.read_csv("/data/competitors_room_prices.csv")
+    avg_comp_price = comp_prices['price'].mean()
+    
+    future = pd.DataFrame({
+        'ds': [pd.to_datetime(date)],
+        'competitor_price': [avg_comp_price]
     })
-    h2o_frame = h2o.H2OFrame(future_data)
-
-    prediction = model.predict(h2o_frame).as_data_frame().iloc[0, 0]
-
+    
+    forecast = model.predict(future)
+    prediction = forecast['yhat'].iloc[0]
+    
     return jsonify({
         'date': date,
         'room_type': room_type,
