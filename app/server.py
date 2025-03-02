@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import pickle
 import logging
+from datetime import datetime
 
 app = Flask(__name__)
 model_dir = "/app/models"
@@ -13,16 +14,16 @@ os.makedirs(model_dir, exist_ok=True)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Room types and realistic price ranges (RM)
+# Room types with price ranges (RM)
 room_types = {
-    'Super Deluxe Twin': (600, 900),
-    'Super Deluxe King': (700, 1000),
-    'Infinity Sea View': (900, 1200),
-    'Junior Suite': (1200, 1600),
-    'Panorama Ocean Suite': (1600, 2000),
+    'Super Deluxe Twin': {'floor': 600, 'ceiling': 900, 'base': 640},
+    'Super Deluxe King': {'floor': 700, 'ceiling': 1000, 'base': 700},
+    'Infinity Sea View': {'floor': 900, 'ceiling': 1200, 'base': 900},
+    'Junior Suite': {'floor': 1200, 'ceiling': 1600, 'base': 1200},
+    'Panorama Ocean Suite': {'floor': 1600, 'ceiling': 2000, 'base': 1600},
 }
 
-# Malaysian holidays for 2025
+# Updated Malaysian holidays for 2023-2025
 holidays = pd.DataFrame({
     'holiday': [
         # 2023 Holidays
@@ -63,6 +64,12 @@ holidays = pd.DataFrame({
     'upper_window': 0,
 })
 
+# Major holidays with significant impact
+major_holidays = [
+    'Chinese New Year', 'Chinese New Year (Second Day)', 'Hari Raya Aidilfitri',
+    'Hari Raya Aidilfitri (Second Day)', 'Hari Raya Aidiladha', 'National Day', 'Malaysia Day'
+]
+
 # Train or load Prophet models
 models = {}
 for room_type in room_types:
@@ -74,26 +81,20 @@ for room_type in room_types:
         )
         df['ds'] = pd.to_datetime(df['ds'])
 
-        # Log data for debugging
-        logger.info(f"Training data for {room_type}: {df['y'].mean()} RM (mean), {df['y'].min()}–{df['y'].max()} RM (range)")
-
         comp_prices = pd.read_csv("/data/competitors_room_prices.csv")
-        comp_prices = comp_prices[['check_date', 'price']].rename(
-            columns={'check_date': 'ds', 'price': 'competitor_price'}
-        )
+        comp_prices = comp_prices[['check_date', 'price']].rename(columns={'check_date': 'ds', 'price': 'competitor_price'})
         comp_prices['ds'] = pd.to_datetime(comp_prices['ds'])
         comp_prices = comp_prices.groupby('ds', as_index=False).agg({'competitor_price': 'mean'})
 
         df = pd.merge(df, comp_prices, on='ds', how='left').fillna({'competitor_price': comp_prices['competitor_price'].mean()})
 
-        # Train Prophet model with constraints
         model = Prophet(
             yearly_seasonality=True,
             weekly_seasonality=True,
             daily_seasonality=False,
             holidays=holidays,
-            changepoint_prior_scale=0.05,  # Reduce overfitting
-            seasonality_prior_scale=10.0   # Smoother seasonality
+            changepoint_prior_scale=0.05,
+            seasonality_prior_scale=10.0
         )
         model.add_regressor('competitor_price')
         model.fit(df)
@@ -105,6 +106,60 @@ for room_type in room_types:
             model = pickle.load(f)
     models[room_type] = model
 
+# Realistic occupancy simulation
+def get_occupancy_data(date):
+    date_obj = pd.to_datetime(date)
+    is_weekend = date_obj.weekday() >= 5
+    is_holiday = date_obj in holidays['ds'].values
+    holiday_name = holidays[holidays['ds'] == date_obj]['holiday'].iloc[0] if is_holiday else None
+    is_major_holiday = holiday_name in major_holidays if holiday_name else False
+
+    base_occupancy = 50  # Weekday base
+    if is_weekend:
+        base_occupancy += 20  # Weekend boost
+    if is_holiday:
+        base_occupancy += 30 if is_major_holiday else 10  # Major vs minor holiday boost
+
+    occupancy = min(95, base_occupancy)  # Cap at 95%
+    return {'occupancy': occupancy, 'reservations': int(228 * occupancy / 100)}
+
+# Historical price calculation
+def calculate_historical_price(occupancy, room_type, historical_data):
+    base = room_types[room_type]['base']
+    if historical_data:
+        avg_price = sum(historical_data) / len(historical_data)
+        return avg_price + (occupancy - 50) * 2 if occupancy > 50 else avg_price
+    return base
+
+# Future pricing logic
+def future_price(room_type, occupancy, competitor_rate, historical_data, date_obj):
+    floor_price = room_types[room_type]['floor']
+    ceiling_price = room_types[room_type]['ceiling']
+    reason = ""
+
+    is_holiday = date_obj in holidays['ds'].values
+    holiday_name = holidays[holidays['ds'] == date_obj]['holiday'].iloc[0] if is_holiday else None
+    is_major_holiday = holiday_name in major_holidays if holiday_name else False
+    is_weekend = date_obj.weekday() >= 5
+
+    if occupancy < 50:
+        price = competitor_rate if competitor_rate > floor_price else floor_price
+        reason = "Matched competitor rate" if competitor_rate > floor_price else "Set to floor price"
+    else:
+        price = calculate_historical_price(occupancy, room_type, historical_data)
+        reason = "Based on historical pricing"
+
+    if is_holiday:
+        multiplier = 1.3 if is_major_holiday else 1.1
+        price *= multiplier
+        reason = f"Higher due to {holiday_name}"
+    elif is_weekend:
+        price *= 1.1
+        reason = "Higher due to weekend demand"
+
+    price = max(floor_price, min(ceiling_price, price))
+    return {'price': price, 'reason': reason}
+
 @app.route('/predict', methods=['GET'])
 def predict():
     date = request.args.get('date')
@@ -112,57 +167,40 @@ def predict():
     if room_type not in room_types:
         return jsonify({'error': 'Invalid room type'}), 400
 
+    date_obj = pd.to_datetime(date)
+    booking_data = get_occupancy_data(date)
+    occupancy = booking_data['occupancy']
+
+    # Fetch competitor rate
     comp_prices = pd.read_csv("/data/competitors_room_prices.csv")
-    avg_comp_price = comp_prices['price'].mean()
-
-    future = pd.DataFrame({
-        'ds': [pd.to_datetime(date)],
-        'competitor_price': [avg_comp_price]
-    })
-
-    model = models[room_type]
-    forecast = model.predict(future)
-    prediction = forecast['yhat'].iloc[0]
-
-    # Constrain prediction to realistic range
-    min_price, max_price = room_types[room_type]
-    prediction = max(min_price, min(max_price, prediction))
-
-    # Generate reason
-    trend = forecast['trend'].iloc[0]
-    yearly = forecast['yearly'].iloc[0]
-    weekly = forecast['weekly'].iloc[0]
-    holiday_effect = forecast['holidays'].iloc[0] if 'holidays' in forecast and forecast['holidays'].iloc[0] != 0 else 0
-    comp_effect = forecast['competitor_price'].iloc[0] if 'competitor_price' in forecast else 0
-
-    reasons = []
-    if holiday_effect > 100:
-        holiday_name = holidays[holidays['ds'] == pd.to_datetime(date)]['holiday'].iloc[0] if pd.to_datetime(date) in holidays['ds'].values else "Holiday"
-        reasons.append(f"Higher due to {holiday_name}")
-    elif holiday_effect < -100:
-        reasons.append("Lower due to post-holiday drop")
-    elif yearly > 100:
-        reasons.append("Higher due to peak season trend")
-    elif yearly < -100:
-        reasons.append("Lower due to off-season trend")
-    elif weekly > 50:
-        reasons.append("Higher due to weekend demand")
-    elif weekly < -50:
-        reasons.append("Lower due to weekday lull")
-    elif comp_effect > 50:
-        reasons.append("Higher due to competitor pricing")
-    elif comp_effect < -50:
-        reasons.append("Lower due to competitive pressure")
+    comp_prices['check_date'] = pd.to_datetime(comp_prices['check_date'])
+    comp_rates = comp_prices[comp_prices['check_date'] == date_obj]['price']
+    if not comp_rates.empty:
+        competitor_rate = comp_rates.mean()
     else:
-        reasons.append("Stable with minor trend adjustments")
+        day_of_week = date_obj.weekday()
+        weekly_avg = comp_prices[comp_prices['check_date'].dt.weekday == day_of_week]['price'].mean()
+        competitor_rate = weekly_avg if not pd.isna(weekly_avg) else comp_prices['price'].mean()
 
-    reason = reasons[0]  # Pick the most significant reason
+    # Prophet prediction
+    model = models[room_type]
+    future = pd.DataFrame({'ds': [date_obj], 'competitor_price': [competitor_rate]})
+    forecast = model.predict(future)
+    prophet_price = forecast['yhat'].iloc[0]
+
+    # Historical data for pricing
+    historical_data = pd.read_csv("/data/bookings.csv")
+    historical_prices = historical_data[historical_data['room_type'] == room_type]['price_per_day'].tolist()
+
+    # Calculate final price
+    result = future_price(room_type, occupancy, competitor_rate, historical_prices, date_obj)
+    final_price = max(room_types[room_type]['floor'], min(room_types[room_type]['ceiling'], result['price']))
 
     return jsonify({
         'date': date,
         'room_type': room_type,
-        'projected_price': round(prediction, 2),
-        'reason': reason
+        'projected_price': round(final_price, 2),
+        'reason': result['reason']
     })
 
 if __name__ == '__main__':
