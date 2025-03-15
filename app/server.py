@@ -5,10 +5,6 @@ import os
 import pickle
 import logging
 from datetime import datetime, timedelta
-import random
-
-# Set a fixed seed for reproducibility
-random.seed(42)  # Ensures consistent random values across runs
 
 app = Flask(__name__)
 model_dir = "/app/models"
@@ -62,16 +58,14 @@ data['Check-in date'] = pd.to_datetime(data['Check-in date'], format='%d %b %Y',
 # Filter for confirmed bookings only
 confirmed_data = data[data['Status'] == 'Confirmed'].copy()
 
-# Simulated admin settings (replace with actual admin panel data in production)
-floor_prices = {'Deluxe No Window': 70.00, 'Superior No Window': 60.00, 'Family 3 No Window kiosk': 100.00}
-ceiling_prices = {'Deluxe No Window': 150.00, 'Superior No Window': 120.00, 'Family 3 No Window kiosk': 180.00}
-base_rates = floor_prices  # Assuming base rate is the floor rate
+# Calculate historical averages from hotel_reservations.xlsx
 historical_avg = confirmed_data.groupby('Room type')['Sales price'].mean().to_dict()
 
-# Simulated competitor rates (replace with RAPIDAPI integration in production)
-def get_competitor_rate(room_type, date):
-    base = historical_avg.get(room_type, 100)
-    return base * (1 + random.uniform(-0.2, 0.2))  # ±20% variation, consistent with seed
+# Assuming competitor pricing is in a column 'Competitor Price' in hotel_reservations.xlsx
+# If not available, we'll use historical_avg as a proxy
+competitor_avg = confirmed_data.groupby('Room type')['Sales price'].mean().to_dict()
+if 'Competitor Price' in confirmed_data.columns:
+    competitor_avg = confirmed_data.groupby('Room type')['Competitor Price'].mean().to_dict()
 
 # Train or load Prophet models
 models = {}
@@ -116,52 +110,46 @@ for room_type in room_types:
         with open(model_path, 'rb') as f:
             models[room_type] = pickle.load(f)
 
-# Dynamic pricing logic based on holidays and competitor rates
-def calculate_projected_price(room_type, date, prophet_price, competitor_rate):
-    floor = floor_prices.get(room_type, 50.00)
-    ceiling = ceiling_prices.get(room_type, 200.00)
-    base = base_rates.get(room_type, floor)
+# Dynamic pricing logic with merged, natural explanation
+def calculate_projected_price(room_type, date, prophet_price):
+    historical_competitor_avg = competitor_avg.get(room_type, prophet_price)
+    
+    # Base price: average of Prophet prediction and historical competitor average
+    price = (prophet_price + historical_competitor_avg) / 2
     
     # Check for holiday effect
     holiday_effect = holidays[holidays['ds'] == date]['holiday'].values
-    holiday_str = f" due to {holiday_effect[0]}" if holiday_effect.size > 0 else ""
-    
-    # Base price on competitor rate
-    price = competitor_rate
-    reason = f"Set to match nearby hotels{holiday_str}"
-    
-    # Adjust price for holidays
     if holiday_effect.size > 0:
         price *= 1.10  # 10% increase for holidays
-        reason += "; raised slightly for holiday demand"
+        explanation = f"This price reflects past trends and market rates, with a slight boost for {holiday_effect[0]}."
+    else:
+        explanation = "This price is set based on historical trends and typical market rates for this period."
     
-    # Ensure price stays within bounds
-    price = min(max(price, floor), ceiling)
-    return round(price, 2), reason
+    return round(price, 2), explanation
 
 @app.route('/generate_forecast', methods=['GET'])
 def generate_forecast():
-    current_date = datetime(2025, 3, 15)  # Hardcoded for consistency with your examples
-    future_dates = pd.date_range(start=current_date + timedelta(days=1), periods=30, freq='D')
+    # Use today's date as the current date (March 15, 2025, as per your context)
+    current_date = datetime(2025, 3, 15)
+    # Generate forecast for the next 30 days starting from tomorrow
+    future_dates = pd.date_range(start=current_date + timedelta(days=1), end=current_date + timedelta(days=31), freq='D')
     
     forecast_data = []
     for room_type, model in models.items():
-        future = model.make_future_dataframe(periods=30)
+        # Make future dataframe for the exact date range
+        future = pd.DataFrame({'ds': future_dates})
         forecast = model.predict(future)
-        forecast = forecast.tail(30).reset_index(drop=True)
         
         for i, row in forecast.iterrows():
             date = row['ds']
-            prophet_price = max(row['yhat'], 0)
-            competitor_rate = get_competitor_rate(room_type, date)
-            projected_price, reason = calculate_projected_price(room_type, date, prophet_price, competitor_rate)
+            prophet_price = max(row['yhat'], 0)  # Historical pricing trend from Prophet
+            projected_price, explanation = calculate_projected_price(room_type, date, prophet_price)
             
             forecast_data.append({
                 'Date': date.strftime('%Y-%m-%d'),
                 'Room Type': room_type,
                 'Projected Price (RM)': projected_price,
                 'Historical Avg Price (RM)': round(historical_avg.get(room_type, prophet_price), 2),
-                'Reason for Projected Price': reason
             })
     
     forecast_df = pd.DataFrame(forecast_data)
